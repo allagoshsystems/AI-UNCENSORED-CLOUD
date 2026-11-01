@@ -3,11 +3,19 @@ name: Run LLM with Cloudflare Tunnel
 "on":
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   run-model:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     env:
+      MODEL_REPO: HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive
+      MODEL_DIR: ${{ github.workspace }}/models
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
       MODEL_PATH: ${{ github.workspace }}/models/model.gguf
 
     steps:
@@ -20,27 +28,84 @@ jobs:
           python-version: "3.12"
 
       - name: Install Dependencies
+        shell: bash
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
-          pip install --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu llama-cpp-python gradio
+          pip install \
+            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
+            llama-cpp-python \
+            gradio \
+            huggingface_hub \
+            hf_transfer
 
       - name: Install Cloudflare Tunnel
+        shell: bash
         run: |
+          set -euxo pipefail
           curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
           cloudflared --version
 
-      - name: Prepare model
+      - name: Download GGUF model from Hugging Face
+        shell: bash
         run: |
-          mkdir -p models
-          if [ ! -f "$MODEL_PATH" ]; then
-            echo "No GGUF model found at $MODEL_PATH"
-            echo "Place your .gguf model in ./models/model.gguf or change MODEL_PATH."
-            exit 1
-          fi
+          set -euxo pipefail
+          mkdir -p "$MODEL_DIR"
 
-      - name: Start Application and Cloudflare Tunnel
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi, hf_hub_download
+
+          repo = os.environ["MODEL_REPO"]
+          token = os.environ.get("HF_TOKEN")
+          local_dir = os.environ["MODEL_DIR"]
+
+          api = HfApi()
+          files = api.list_repo_files(repo_id=repo, repo_type="model", token=token)
+          gguf_files = [f for f in files if f.lower().endswith(".gguf")]
+
+          if not gguf_files:
+              raise RuntimeError(f"No .gguf files found in {repo}")
+
+          preferred = [
+              f for f in gguf_files
+              if "f16" in f.lower() or "fp16" in f.lower() or "gguf" in f.lower()
+          ]
+
+          chosen = preferred[0] if preferred else gguf_files[0]
+
+          downloaded = hf_hub_download(
+              repo_id=repo,
+              filename=chosen,
+              repo_type="model",
+              token=token,
+              local_dir=local_dir,
+          )
+
+          print(f"Downloaded model: {downloaded}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"MODEL_PATH={downloaded}\n")
+          PY
+
+          ls -lh "$MODEL_DIR"
+
+      - name: Start Application
+        shell: bash
         run: |
+          set -euxo pipefail
+          echo "Using model at: $MODEL_PATH"
           nohup python app.py > app.log 2>&1 &
           sleep 20
-          cloudflared tunnel --no-autoupdate --url http://localhost:7860
+
+          curl -fsS http://localhost:7860 >/dev/null || {
+            echo "Gradio did not start correctly"
+            tail -n 200 app.log || true
+            exit 1
+          }
+
+      - name: Start Cloudflare Tunnel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cloudflared tunnel --no-autoupdate --url http://localhost:7860 --loglevel info
