@@ -1,6 +1,6 @@
 name: Run LLM with Cloudflare Tunnel
 
-on:
+"on":
   workflow_dispatch:
 
 jobs:
