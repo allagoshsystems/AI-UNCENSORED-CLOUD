@@ -1,35 +1,46 @@
 name: Run LLM with Cloudflare Tunnel
 
 on:
-workflow_dispatch:
+  workflow_dispatch:
 
 jobs:
-run-model:
-runs-on: ubuntu-latest
-timeout-minutes: 360
+  run-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      MODEL_PATH: ${{ github.workspace }}/models/model.gguf
 
-steps:
-  - name: Checkout Repository
-    uses: actions/checkout@v4
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-  - name: Set up Python
-    uses: actions/setup-python@v5
-    with:
-      python-version: '3.12'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-  - name: Install Dependencies
-    run: |
-      python -m pip install --upgrade pip
-      pip install --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu llama-cpp-python gradio
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu llama-cpp-python gradio
 
-  - name: Install Cloudflare Tunnel
-    run: |
-      curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-      sudo dpkg -i cloudflared.deb
-      cloudflared --version
+      - name: Install Cloudflare Tunnel
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          cloudflared --version
 
-  - name: Start Application and Cloudflare Tunnel
-    run: |
-      python app.py &
-      sleep 15
-      cloudflared tunnel --url http://localhost:7860
+      - name: Prepare model
+        run: |
+          mkdir -p models
+          if [ ! -f "$MODEL_PATH" ]; then
+            echo "No GGUF model found at $MODEL_PATH"
+            echo "Place your .gguf model in ./models/model.gguf or change MODEL_PATH."
+            exit 1
+          fi
+
+      - name: Start Application and Cloudflare Tunnel
+        run: |
+          nohup python app.py > app.log 2>&1 &
+          sleep 20
+          cloudflared tunnel --no-autoupdate --url http://localhost:7860
