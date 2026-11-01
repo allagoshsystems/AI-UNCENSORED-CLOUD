@@ -108,4 +108,21 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          cloudflared tunnel --no-autoupdate --url http://localhost:7860 --loglevel info
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:7860 --loglevel info > cloudflared.log 2>&1 &
+
+          for i in $(seq 1 30); do
+            if grep -Eo 'https://[^[:space:]]+trycloudflare.com|https://[^[:space:]]+cloudflareaccess.com' cloudflared.log >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+
+          url=$(grep -Eo 'https://[^[:space:]]+trycloudflare.com|https://[^[:space:]]+cloudflareaccess.com' cloudflared.log | tail -n 1 || true)
+          if [[ -z "$url" ]]; then
+            echo "Cloudflare tunnel did not start correctly"
+            tail -n 200 cloudflared.log || true
+            exit 1
+          fi
+
+          echo "Cloudflare tunnel URL: $url"
+          tail -n 50 cloudflared.log
