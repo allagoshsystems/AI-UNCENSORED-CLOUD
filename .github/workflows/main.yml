@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Dependencies
+      - name: Install Python dependencies
         shell: bash
         run: |
           set -euxo pipefail
@@ -51,11 +51,11 @@ jobs:
         run: |
           set -euxo pipefail
           if [[ -z "${HF_TOKEN:-}" ]]; then
-            echo "::error::HF_TOKEN secret is missing or empty. Add a valid Hugging Face token in repository secrets."
+            echo "::error::HF_TOKEN secret is missing or empty. Add your Hugging Face token to repository secrets."
             exit 1
           fi
 
-      - name: Download GGUF model from Hugging Face
+      - name: Download model from Hugging Face
         shell: bash
         run: |
           set -euxo pipefail
@@ -66,11 +66,11 @@ jobs:
           from huggingface_hub import HfApi, hf_hub_download
 
           repo = os.environ["MODEL_REPO"]
-          token = os.environ.get("HF_TOKEN") or None
+          token = os.environ.get("HF_TOKEN")
           local_dir = os.environ["MODEL_DIR"]
 
           if not token:
-              raise RuntimeError("HF_TOKEN is empty. Add the secret and rerun the workflow.")
+              raise RuntimeError("HF_TOKEN is empty. Add the secret and rerun.")
 
           api = HfApi()
           files = api.list_repo_files(repo_id=repo, repo_type="model", token=token)
@@ -81,7 +81,7 @@ jobs:
 
           preferred = [
               f for f in gguf_files
-              if "f16" in f.lower() or "fp16" in f.lower() or "q4" in f.lower() or "gguf" in f.lower()
+              if ("f16" in f.lower() or "fp16" in f.lower() or "q4" in f.lower() or "gguf" in f.lower())
           ]
 
           chosen = preferred[0] if preferred else gguf_files[0]
@@ -99,27 +99,35 @@ jobs:
               env_file.write(f"MODEL_PATH={downloaded}\n")
           PY
 
+          echo "MODEL_PATH=$MODEL_PATH" >> "$GITHUB_ENV"
           ls -lh "$MODEL_DIR"
 
-      - name: Start Application
+      - name: Start Gradio app
         shell: bash
         run: |
           set -euxo pipefail
-          echo "Using model: ${MODEL_PATH:-}"
+
+          if [[ -z "${MODEL_PATH:-}" ]]; then
+            echo "MODEL_PATH is empty"
+            exit 1
+          fi
+
+          echo "Using model at: $MODEL_PATH"
+
           nohup python app.py > app.log 2>&1 &
           sleep 5
 
-          for i in $(seq 1 60); do
+          for i in $(seq 1 120); do
             if curl -fsS http://127.0.0.1:7860 >/dev/null; then
-              echo "Gradio is running on 127.0.0.1:7860"
+              echo "Gradio is responding on 127.0.0.1:7860"
               break
             fi
-            echo "Waiting for Gradio... attempt $i"
+            echo "Waiting for Gradio to start... attempt $i/120"
             sleep 2
           done
 
           curl -fsS http://127.0.0.1:7860 >/dev/null || {
-            echo "Gradio did not start correctly"
+            echo "Gradio failed to start"
             tail -n 200 app.log || true
             exit 1
           }
@@ -128,15 +136,17 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:7860 --loglevel info > cloudflared.log 2>&1 &
           sleep 10
 
-          for i in $(seq 1 60); do
+          for i in $(seq 1 120); do
             url=$(grep -Eo 'https://[^[:space:]]+trycloudflare.com|https://[^[:space:]]+cloudflareaccess.com' cloudflared.log | tail -n 1 || true)
             if [[ -n "$url" ]]; then
               echo "Cloudflare tunnel URL: $url"
               break
             fi
+            echo "Waiting for Cloudflare URL... attempt $i/120"
             sleep 2
           done
 
@@ -147,5 +157,13 @@ jobs:
             exit 1
           fi
 
-          echo "Final URL: $url"
+          echo "Tunnel ready: $url"
           tail -n 50 cloudflared.log
+
+      - name: Keep Run Alive for 6 Hours
+        shell: bash
+        timeout-minutes: 360
+        run: |
+          set -euxo pipefail
+          echo "Workflow is running. The tunnel will stay active until the job ends."
+          sleep 21600
