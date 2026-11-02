@@ -42,8 +42,8 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
+          curl -L --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
           cloudflared --version
 
       - name: Validate Hugging Face token
@@ -81,9 +81,8 @@ jobs:
 
           preferred = [
               f for f in gguf_files
-              if ("f16" in f.lower() or "fp16" in f.lower() or "q4" in f.lower() or "gguf" in f.lower())
+              if any(k in f.lower() for k in ("f16", "fp16", "q4", "q5", "q8"))
           ]
-
           chosen = preferred[0] if preferred else gguf_files[0]
 
           downloaded = hf_hub_download(
@@ -95,11 +94,16 @@ jobs:
           )
 
           print(f"Downloaded model: {downloaded}")
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
-              env_file.write(f"MODEL_PATH={downloaded}\n")
+
+          github_env = os.environ.get("GITHUB_ENV")
+          if github_env:
+              with open(github_env, "a", encoding="utf-8") as env_file:
+                  env_file.write(f"MODEL_PATH={downloaded}\n")
+          else:
+              raise RuntimeError("GITHUB_ENV is not defined")
           PY
 
-          echo "MODEL_PATH=$MODEL_PATH" >> "$GITHUB_ENV"
+          echo "MODEL_PATH is set"
           ls -lh "$MODEL_DIR"
 
       - name: Start Gradio app
@@ -108,7 +112,7 @@ jobs:
           set -euxo pipefail
 
           if [[ -z "${MODEL_PATH:-}" ]]; then
-            echo "MODEL_PATH is empty"
+            echo "::error::MODEL_PATH is empty after model download."
             exit 1
           fi
 
@@ -127,7 +131,7 @@ jobs:
           done
 
           curl -fsS http://127.0.0.1:7860 >/dev/null || {
-            echo "Gradio failed to start"
+            echo "::error::Gradio failed to start"
             tail -n 200 app.log || true
             exit 1
           }
@@ -152,7 +156,7 @@ jobs:
 
           url=$(grep -Eo 'https://[^[:space:]]+trycloudflare.com|https://[^[:space:]]+cloudflareaccess.com' cloudflared.log | tail -n 1 || true)
           if [[ -z "$url" ]]; then
-            echo "Cloudflare tunnel did not start correctly"
+            echo "::error::Cloudflare tunnel did not start correctly"
             tail -n 300 cloudflared.log || true
             exit 1
           fi
