@@ -16,7 +16,6 @@ jobs:
       MODEL_DIR: ${{ github.workspace }}/models
       HF_HUB_ENABLE_HF_TRANSFER: "1"
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      MODEL_PATH: ${{ github.workspace }}/models/model.gguf
 
     steps:
       - name: Checkout Repository
@@ -82,7 +81,7 @@ jobs:
 
           preferred = [
               f for f in gguf_files
-              if "f16" in f.lower() or "fp16" in f.lower() or "q4" in f.lower()
+              if "f16" in f.lower() or "fp16" in f.lower() or "q4" in f.lower() or "gguf" in f.lower()
           ]
 
           chosen = preferred[0] if preferred else gguf_files[0]
@@ -106,11 +105,20 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          echo "Using model at: $MODEL_PATH"
+          echo "Using model: ${MODEL_PATH:-}"
           nohup python app.py > app.log 2>&1 &
-          sleep 20
+          sleep 5
 
-          curl -fsS http://localhost:7860 >/dev/null || {
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:7860 >/dev/null; then
+              echo "Gradio is running on 127.0.0.1:7860"
+              break
+            fi
+            echo "Waiting for Gradio... attempt $i"
+            sleep 2
+          done
+
+          curl -fsS http://127.0.0.1:7860 >/dev/null || {
             echo "Gradio did not start correctly"
             tail -n 200 app.log || true
             exit 1
@@ -120,10 +128,13 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          nohup cloudflared tunnel --no-autoupdate --url http://localhost:7860 --loglevel info > cloudflared.log 2>&1 &
+          nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:7860 --loglevel info > cloudflared.log 2>&1 &
+          sleep 10
 
-          for i in $(seq 1 30); do
-            if grep -Eo 'https://[^[:space:]]+trycloudflare.com|https://[^[:space:]]+cloudflareaccess.com' cloudflared.log >/dev/null 2>&1; then
+          for i in $(seq 1 60); do
+            url=$(grep -Eo 'https://[^[:space:]]+trycloudflare.com|https://[^[:space:]]+cloudflareaccess.com' cloudflared.log | tail -n 1 || true)
+            if [[ -n "$url" ]]; then
+              echo "Cloudflare tunnel URL: $url"
               break
             fi
             sleep 2
@@ -132,9 +143,9 @@ jobs:
           url=$(grep -Eo 'https://[^[:space:]]+trycloudflare.com|https://[^[:space:]]+cloudflareaccess.com' cloudflared.log | tail -n 1 || true)
           if [[ -z "$url" ]]; then
             echo "Cloudflare tunnel did not start correctly"
-            tail -n 200 cloudflared.log || true
+            tail -n 300 cloudflared.log || true
             exit 1
           fi
 
-          echo "Cloudflare tunnel URL: $url"
+          echo "Final URL: $url"
           tail -n 50 cloudflared.log
