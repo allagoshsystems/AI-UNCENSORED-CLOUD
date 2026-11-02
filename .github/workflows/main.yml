@@ -95,15 +95,11 @@ jobs:
 
           print(f"Downloaded model: {downloaded}")
 
-          github_env = os.environ.get("GITHUB_ENV")
-          if github_env:
-              with open(github_env, "a", encoding="utf-8") as env_file:
-                  env_file.write(f"MODEL_PATH={downloaded}\n")
-          else:
-              raise RuntimeError("GITHUB_ENV is not defined")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"MODEL_PATH={downloaded}\n")
           PY
 
-          echo "MODEL_PATH is set"
+          echo "Downloaded model files:"
           ls -lh "$MODEL_DIR"
 
       - name: Start Gradio app
@@ -112,13 +108,16 @@ jobs:
           set -euxo pipefail
 
           if [[ -z "${MODEL_PATH:-}" ]]; then
-            echo "::error::MODEL_PATH is empty after model download."
+            echo "::error::MODEL_PATH is empty after download."
             exit 1
           fi
 
           echo "Using model at: $MODEL_PATH"
 
           nohup python app.py > app.log 2>&1 &
+          APP_PID=$!
+          echo "APP_PID=$APP_PID" >> "$GITHUB_ENV"
+
           sleep 5
 
           for i in $(seq 1 120); do
@@ -142,6 +141,9 @@ jobs:
           set -euxo pipefail
 
           nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:7860 --loglevel info > cloudflared.log 2>&1 &
+          TUNNEL_PID=$!
+          echo "TUNNEL_PID=$TUNNEL_PID" >> "$GITHUB_ENV"
+
           sleep 10
 
           for i in $(seq 1 120); do
@@ -164,10 +166,15 @@ jobs:
           echo "Tunnel ready: $url"
           tail -n 50 cloudflared.log
 
-      - name: Keep Run Alive for 6 Hours
+      - name: Keep real app and tunnel alive
         shell: bash
-        timeout-minutes: 360
         run: |
           set -euxo pipefail
-          echo "Workflow is running. The tunnel will stay active until the job ends."
-          sleep 21600
+          echo "Keeping the Gradio app and Cloudflare tunnel alive while both processes are running."
+
+          while kill -0 "${APP_PID:-}" 2>/dev/null && kill -0 "${TUNNEL_PID:-}" 2>/dev/null; do
+            sleep 30
+          done
+
+          echo "::error::One of the required processes exited."
+          exit 1
