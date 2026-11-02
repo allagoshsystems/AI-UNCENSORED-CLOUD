@@ -47,6 +47,15 @@ jobs:
           sudo dpkg -i cloudflared.deb
           cloudflared --version
 
+      - name: Validate Hugging Face token
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [[ -z "${HF_TOKEN:-}" ]]; then
+            echo "::error::HF_TOKEN secret is missing or empty. Add a valid Hugging Face token in repository secrets."
+            exit 1
+          fi
+
       - name: Download GGUF model from Hugging Face
         shell: bash
         run: |
@@ -58,8 +67,11 @@ jobs:
           from huggingface_hub import HfApi, hf_hub_download
 
           repo = os.environ["MODEL_REPO"]
-          token = os.environ.get("HF_TOKEN")
+          token = os.environ.get("HF_TOKEN") or None
           local_dir = os.environ["MODEL_DIR"]
+
+          if not token:
+              raise RuntimeError("HF_TOKEN is empty. Add the secret and rerun the workflow.")
 
           api = HfApi()
           files = api.list_repo_files(repo_id=repo, repo_type="model", token=token)
@@ -70,7 +82,7 @@ jobs:
 
           preferred = [
               f for f in gguf_files
-              if "f16" in f.lower() or "fp16" in f.lower() or "gguf" in f.lower()
+              if "f16" in f.lower() or "fp16" in f.lower() or "q4" in f.lower()
           ]
 
           chosen = preferred[0] if preferred else gguf_files[0]
