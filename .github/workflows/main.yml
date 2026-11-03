@@ -1,6 +1,6 @@
-name: Run LLM with Cloudflare Tunnel
+name: Run llama.cpp + Gradio + Cloudflare Tunnel
 
-"on":
+on:
   workflow_dispatch:
 
 permissions:
@@ -16,6 +16,7 @@ jobs:
       MODEL_DIR: ${{ github.workspace }}/models
       HF_HUB_ENABLE_HF_TRANSFER: "1"
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
 
     steps:
       - name: Checkout Repository
@@ -25,6 +26,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git libcurl4-openssl-dev
 
       - name: Install Python dependencies
         shell: bash
@@ -46,16 +54,20 @@ jobs:
           sudo dpkg -i /tmp/cloudflared.deb
           cloudflared --version
 
-      - name: Validate Hugging Face token
+      - name: Validate required secrets
         shell: bash
         run: |
           set -euxo pipefail
           if [[ -z "${HF_TOKEN:-}" ]]; then
-            echo "::error::HF_TOKEN secret is missing or empty. Add your Hugging Face token to repository secrets."
+            echo "::error::HF_TOKEN secret is missing or empty."
+            exit 1
+          fi
+          if [[ -z "${LLAMA_API_KEY:-}" ]]; then
+            echo "::error::LLAMA_API_KEY secret is missing or empty."
             exit 1
           fi
 
-      - name: Download model from Hugging Face
+      - name: Download GGUF model from Hugging Face
         shell: bash
         run: |
           set -euxo pipefail
@@ -69,9 +81,6 @@ jobs:
           token = os.environ.get("HF_TOKEN")
           local_dir = os.environ["MODEL_DIR"]
 
-          if not token:
-              raise RuntimeError("HF_TOKEN is empty. Add the secret and rerun.")
-
           api = HfApi()
           files = api.list_repo_files(repo_id=repo, repo_type="model", token=token)
           gguf_files = [f for f in files if f.lower().endswith(".gguf")]
@@ -79,10 +88,7 @@ jobs:
           if not gguf_files:
               raise RuntimeError(f"No .gguf files found in {repo}")
 
-          preferred = [
-              f for f in gguf_files
-              if any(k in f.lower() for k in ("f16", "fp16", "q4", "q5", "q8"))
-          ]
+          preferred = [f for f in gguf_files if any(k in f.lower() for k in ("f16", "fp16", "q4", "q5", "q8"))]
           chosen = preferred[0] if preferred else gguf_files[0]
 
           downloaded = hf_hub_download(
@@ -99,8 +105,16 @@ jobs:
               env_file.write(f"MODEL_PATH={downloaded}\n")
           PY
 
-          echo "Downloaded model files:"
+          echo "Downloaded files:"
           ls -lh "$MODEL_DIR"
+
+      - name: Build llama.cpp server
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/ggerganov/llama.cpp.git "$RUNNER_TEMP/llama.cpp"
+          cmake -S "$RUNNER_TEMP/llama.cpp" -B "$RUNNER_TEMP/llama.cpp/build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/llama.cpp/build" --config Release --target llama-server -j "$(nproc)"
 
       - name: Start Gradio app
         shell: bash
@@ -135,46 +149,57 @@ jobs:
             exit 1
           }
 
+      - name: Start llama.cpp server
+        shell: bash
+        run: |
+          set -euxo pipefail
+          SERVER_BIN="$RUNNER_TEMP/llama.cpp/build/bin/llama-server"
+
+          if [[ ! -x "$SERVER_BIN" ]]; then
+            echo "::error::llama-server binary not found at $SERVER_BIN"
+            exit 1
+          fi
+
+          nohup "$SERVER_BIN" \
+            -hf "$MODEL_REPO" \
+            --host 0.0.0.0 \
+            --port 8080 \
+            --api-key "$LLAMA_API_KEY" \
+            > llama-server.log 2>&1 &
+
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> "$GITHUB_ENV"
+
+          sleep 10
+
+          for i in $(seq 1 180); do
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "::error::llama-server exited while starting"
+              tail -n 200 llama-server.log || true
+              exit 1
+            fi
+
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+              echo "llama.cpp server is healthy on port 8080"
+              break
+            fi
+
+            echo "Waiting for llama.cpp model startup... attempt $i/180"
+            sleep 5
+          done
+
+          curl -fsS http://127.0.0.1:8080/health >/dev/null || {
+            echo "::error::llama.cpp server did not become healthy"
+            tail -n 200 llama-server.log || true
+            exit 1
+          }
+
       - name: Start Cloudflare Tunnel
         shell: bash
         run: |
           set -euxo pipefail
 
-          nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:7860 --loglevel info > cloudflared.log 2>&1 &
+          nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8080 --loglevel info > cloudflared.log 2>&1 &
           TUNNEL_PID=$!
-          echo "TUNNEL_PID=$TUNNEL_PID" >> "$GITHUB_ENV"
-
-          sleep 10
-
-          for i in $(seq 1 120); do
-            url=$(grep -Eo 'https://[^[:space:]]+trycloudflare.com|https://[^[:space:]]+cloudflareaccess.com' cloudflared.log | tail -n 1 || true)
-            if [[ -n "$url" ]]; then
-              echo "Cloudflare tunnel URL: $url"
-              break
-            fi
-            echo "Waiting for Cloudflare URL... attempt $i/120"
-            sleep 2
-          done
-
-          url=$(grep -Eo 'https://[^[:space:]]+trycloudflare.com|https://[^[:space:]]+cloudflareaccess.com' cloudflared.log | tail -n 1 || true)
-          if [[ -z "$url" ]]; then
-            echo "::error::Cloudflare tunnel did not start correctly"
-            tail -n 300 cloudflared.log || true
-            exit 1
-          fi
-
-          echo "Tunnel ready: $url"
-          tail -n 50 cloudflared.log
-
-      - name: Keep real app and tunnel alive
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "Keeping the Gradio app and Cloudflare tunnel alive while both processes are running."
-
-          while kill -0 "${APP_PID:-}" 2>/dev/null && kill -0 "${TUNNEL_PID:-}" 2>/dev/null; do
-            sleep 30
-          done
-
-          echo "::error::One of the required processes exited."
-          exit 1
+          echo "TUNNEL_PID=$TUNNEL_PID" >>
+
