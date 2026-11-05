@@ -1,39 +1,37 @@
-name: Run Gemma 4 GGUF on GitHub Actions
+
+name: Run GPT-oss 20B GGUF on GitHub Actions
 
 on:
   workflow_dispatch:
     inputs:
       context_size:
-        description: "Context size (start with 4096 on a standard runner)"
+        description: "Context size (model recommends minimum 8192)"
         required: true
-        default: "4096"
+        default: "8192"
       quantization:
         description: "GGUF quantization"
         required: true
         type: choice
         options:
-          - Q4_K_M
-          - IQ4_XS
-          - Q3_K_M
-        default: Q4_K_M
+          - IQ4_NL
+        default: IQ4_NL
 
 permissions:
   contents: read
 
-# A new run replaces the previous run for this repository.
 concurrency:
-  group: gemma4-public-server
+  group: gpt-oss-20b-public-server
   cancel-in-progress: true
 
 jobs:
   serve:
-    name: Build, load Gemma 4, then open Cloudflare Tunnel
+    name: Build, load GPT-oss 20B, then open Cloudflare Quick Tunnel
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
     env:
-      MODEL_REPO: HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive
-      MODEL_PREFIX: Gemma-4-E4B-Uncensored-HauhauCS-Aggressive
+      MODEL_REPO: DavidAU/OpenAi-GPT-oss-20b-HERETIC-uncensored-NEO-Imatrix-gguf
+      MODEL_FILE: OpenAI-20B-NEO-CODEPlus-Uncensored-IQ4_NL.gguf
       MODEL_PATH: ${{ github.workspace }}/models/model.gguf
       LLAMA_PORT: "8080"
       LLAMA_CTX_SIZE: ${{ inputs.context_size }}
@@ -82,15 +80,15 @@ jobs:
           test -x llama.cpp/build/bin/llama-server
           llama.cpp/build/bin/llama-server --version
 
-      - name: Download selected GGUF from Hugging Face
+      - name: Download GPT-oss 20B GGUF from Hugging Face
         shell: bash
-        env:
-          QUANT: ${{ inputs.quantization }}
         run: |
           set -euo pipefail
           mkdir -p models
-          FILE="${MODEL_PREFIX}-${QUANT}.gguf"
-          URL="https://huggingface.co/${MODEL_REPO}/resolve/main/${FILE}?download=true"
+
+          URL="https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FILE}?download=true"
+
+          echo "Downloading: ${MODEL_FILE}"
 
           if [[ -n "${HF_TOKEN:-}" ]]; then
             curl --fail --location --retry 5 --retry-all-errors \
@@ -102,8 +100,10 @@ jobs:
           fi
 
           test -s "$MODEL_PATH"
-          echo "Downloaded:"
+
+          echo "Downloaded model:"
           ls -lh "$MODEL_PATH"
+          echo "Disk after download:"
           df -h /
 
       - name: Install cloudflared
@@ -116,13 +116,13 @@ jobs:
           sudo dpkg -i /tmp/cloudflared.deb
           cloudflared --version
 
-      - name: Start model, verify health, then start free Quick Tunnel
+      - name: Start GPT-oss 20B, verify health, then start free Quick Tunnel
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p logs
 
-          # Start llama.cpp first; expose it only after its health check passes.
+          # Start the model server first.
           nohup ./llama.cpp/build/bin/llama-server \
             --model "$MODEL_PATH" \
             --host 127.0.0.1 \
@@ -130,79 +130,97 @@ jobs:
             --ctx-size "$LLAMA_CTX_SIZE" \
             --threads "$LLAMA_THREADS" \
             --batch-size "$LLAMA_BATCH_SIZE" \
+            --parallel 1 \
             --jinja \
-            --temp 1.0 \
+            --temp 0.6 \
             --top-p 0.95 \
-            --top-k 64 \
+            --top-k 40 \
+            --min-p 0.05 \
+            --repeat-penalty 1.1 \
             > logs/llama-server.log 2>&1 &
+
           MODEL_PID=$!
           echo "$MODEL_PID" > logs/llama-server.pid
 
-          echo "Waiting for llama.cpp health check..."
+          echo "Waiting for GPT-oss health check..."
+
           for attempt in $(seq 1 180); do
-            if curl --silent --fail "http://127.0.0.1:${LLAMA_PORT}/health" >/dev/null; then
-              echo "llama.cpp is healthy."
+            if curl --silent --fail \
+              "http://127.0.0.1:${LLAMA_PORT}/health" >/dev/null; then
+              echo "GPT-oss is healthy."
               break
             fi
+
             if ! kill -0 "$MODEL_PID" 2>/dev/null; then
               echo "::error::llama-server exited before becoming healthy."
-              tail -n 100 logs/llama-server.log || true
+              tail -n 150 logs/llama-server.log || true
               exit 1
             fi
+
             if [[ "$attempt" -eq 180 ]]; then
-              echo "::error::llama-server did not become healthy within 15 minutes."
-              tail -n 100 logs/llama-server.log || true
+              echo "::error::Model did not become healthy within 15 minutes."
+              tail -n 150 logs/llama-server.log || true
               exit 1
             fi
+
             sleep 5
           done
 
-          # Cloudflare Quick Tunnel gives a temporary *.trycloudflare.com URL.
-          # It needs no purchased domain and no tunnel-token secret.
-          cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:${LLAMA_PORT}" \
+          # Start free Cloudflare Quick Tunnel.
+          cloudflared tunnel --no-autoupdate \
+            --url "http://127.0.0.1:${LLAMA_PORT}" \
             > logs/cloudflared.log 2>&1 &
+
           TUNNEL_PID=$!
           echo "$TUNNEL_PID" > logs/cloudflared.pid
 
-          echo "Waiting for the public Quick Tunnel URL..."
+          echo "Waiting for public URL..."
+
           PUBLIC_URL=""
+
           for attempt in $(seq 1 60); do
-            PUBLIC_URL="$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' logs/cloudflared.log | head -n 1 || true)"
+            PUBLIC_URL="$(grep -Eo \
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              logs/cloudflared.log | head -n 1 || true)"
+
             if [[ -n "$PUBLIC_URL" ]]; then
               break
             fi
+
             if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-              echo "::error::cloudflared exited before creating a Quick Tunnel."
+              echo "::error::Cloudflare Quick Tunnel exited."
               cat logs/cloudflared.log || true
               exit 1
             fi
+
             sleep 2
           done
 
           if [[ -z "$PUBLIC_URL" ]]; then
-            echo "::error::Could not find the Quick Tunnel URL in cloudflared output."
+            echo "::error::Could not obtain the Quick Tunnel URL."
             cat logs/cloudflared.log || true
             exit 1
           fi
 
           {
-            echo "## Gemma 4 is ready"
+            echo "## GPT-oss 20B is ready"
             echo
             echo "**Public chat URL:** $PUBLIC_URL"
             echo
-            echo "This temporary URL works only while this GitHub Actions job is running."
-            echo "Anyone with the URL may be able to access the model; do not share it publicly."
+            echo "Temporary URL works while this GitHub Actions job is running."
+            echo "Protect this URL; anyone who obtains it may access the model."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "::notice title=Gemma 4 public URL::$PUBLIC_URL"
-          echo "Quick Tunnel is running. Keeping the GitHub Actions job alive..."
+          echo "::notice title=GPT-oss 20B public URL::$PUBLIC_URL"
+          echo "GPT-oss is running. Keeping the workflow alive..."
+
           wait "$TUNNEL_PID"
 
       - name: Upload service logs if the job fails
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: gemma4-server-logs
+          name: gpt-oss-20b-server-logs
           path: logs/
           if-no-files-found: ignore
           retention-days: 3
