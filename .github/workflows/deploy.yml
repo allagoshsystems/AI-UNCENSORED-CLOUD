@@ -1,0 +1,148 @@
+name: Run Gemma 4 GGUF on GitHub Actions
+
+on:
+  workflow_dispatch:
+    inputs:
+      context_size:
+        description: "Context size (start with 4096 on a standard runner)"
+        required: true
+        default: "4096"
+      quantization:
+        description: "GGUF quantization"
+        required: true
+        type: choice
+        options:
+          - Q4_K_M
+          - IQ4_XS
+          - Q3_K_M
+        default: Q4_K_M
+
+permissions:
+  contents: read
+
+# A new run replaces the previous run for this repository.
+concurrency:
+  group: gemma4-public-server
+  cancel-in-progress: true
+
+jobs:
+  serve:
+    name: Build, load Gemma 4, then open Cloudflare Tunnel
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      MODEL_REPO: HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive
+      MODEL_PREFIX: Gemma-4-E4B-Uncensored-HauhauCS-Aggressive
+      MODEL_PATH: ${{ github.workspace }}/models/model.gguf
+      LLAMA_PORT: "8080"
+      LLAMA_CTX_SIZE: ${{ inputs.context_size }}
+      LLAMA_THREADS: "4"
+      LLAMA_BATCH_SIZE: "128"
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show runner resources
+        shell: bash
+        run: |
+          set -e
+          echo "CPU:"
+          nproc
+          echo "Memory:"
+          free -h
+          echo "Disk:"
+          df -h /
+
+      - name: Install build and runtime dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git libcurl4-openssl-dev \
+            pkg-config curl ca-certificates
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Build llama.cpp server
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+          cmake -S llama.cpp -B llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CURL=ON
+          cmake --build llama.cpp/build \
+            --config Release \
+            --target llama-server \
+            -j2
+          test -x llama.cpp/build/bin/llama-server
+          llama.cpp/build/bin/llama-server --version
+
+      - name: Download selected GGUF from Hugging Face
+        shell: bash
+        env:
+          QUANT: ${{ inputs.quantization }}
+        run: |
+          set -euo pipefail
+          mkdir -p models
+          FILE="${MODEL_PREFIX}-${QUANT}.gguf"
+          URL="https://huggingface.co/${MODEL_REPO}/resolve/main/${FILE}?download=true"
+
+          if [[ -n "${HF_TOKEN:-}" ]]; then
+            curl --fail --location --retry 5 --retry-all-errors \
+              --header "Authorization: Bearer ${HF_TOKEN}" \
+              "$URL" --output "$MODEL_PATH"
+          else
+            curl --fail --location --retry 5 --retry-all-errors \
+              "$URL" --output "$MODEL_PATH"
+          fi
+
+          test -s "$MODEL_PATH"
+          echo "Downloaded:"
+          ls -lh "$MODEL_PATH"
+          df -h /
+
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 5 \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
+            --output /tmp/cloudflared.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          cloudflared --version
+
+      - name: Validate Cloudflare token
+        shell: bash
+        run: |
+          if [[ -z "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]]; then
+            echo "::error::Missing CLOUDFLARE_TUNNEL_TOKEN repository secret."
+            exit 1
+          fi
+
+      - name: Start model, verify health, then start tunnel
+        shell: bash
+        run: |
+          chmod +x scripts/start.sh
+          scripts/start.sh
+        env:
+          MODEL_PATH: ${{ env.MODEL_PATH }}
+          LLAMA_PORT: ${{ env.LLAMA_PORT }}
+          LLAMA_CTX_SIZE: ${{ env.LLAMA_CTX_SIZE }}
+          LLAMA_THREADS: ${{ env.LLAMA_THREADS }}
+          LLAMA_BATCH_SIZE: ${{ env.LLAMA_BATCH_SIZE }}
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+
+      - name: Upload service logs if the job fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemma4-server-logs
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 3
