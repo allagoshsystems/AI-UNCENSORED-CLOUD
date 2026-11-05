@@ -14,11 +14,8 @@ jobs:
   serve:
     name: Prepare LTX-2.5 and open Cloudflare Quick Tunnel
     # Requires a GitHub-managed GPU larger runner. Standard ubuntu-latest has no GPU.
-    runs-on:
-      group: ${{ vars.LTX_RUNNER_GROUP }}
-      labels: ${{ vars.LTX_RUNNER_LABEL }}
+  runs-on: ubuntu-latest
     timeout-minutes: 350
-
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       COMFY_PORT: "8188"
