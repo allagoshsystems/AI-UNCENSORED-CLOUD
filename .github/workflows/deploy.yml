@@ -40,7 +40,6 @@ jobs:
       LLAMA_THREADS: "4"
       LLAMA_BATCH_SIZE: "128"
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
 
     steps:
       - name: Checkout repository
@@ -117,26 +116,87 @@ jobs:
           sudo dpkg -i /tmp/cloudflared.deb
           cloudflared --version
 
-      - name: Validate Cloudflare token
+      - name: Start model, verify health, then start free Quick Tunnel
         shell: bash
         run: |
-          if [[ -z "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]]; then
-            echo "::error::Missing CLOUDFLARE_TUNNEL_TOKEN repository secret."
+          set -euo pipefail
+          mkdir -p logs
+
+          # Start llama.cpp first; expose it only after its health check passes.
+          nohup ./llama.cpp/build/bin/llama-server \
+            --model "$MODEL_PATH" \
+            --host 127.0.0.1 \
+            --port "$LLAMA_PORT" \
+            --ctx-size "$LLAMA_CTX_SIZE" \
+            --threads "$LLAMA_THREADS" \
+            --batch-size "$LLAMA_BATCH_SIZE" \
+            --jinja \
+            --temp 1.0 \
+            --top-p 0.95 \
+            --top-k 64 \
+            > logs/llama-server.log 2>&1 &
+          MODEL_PID=$!
+          echo "$MODEL_PID" > logs/llama-server.pid
+
+          echo "Waiting for llama.cpp health check..."
+          for attempt in $(seq 1 180); do
+            if curl --silent --fail "http://127.0.0.1:${LLAMA_PORT}/health" >/dev/null; then
+              echo "llama.cpp is healthy."
+              break
+            fi
+            if ! kill -0 "$MODEL_PID" 2>/dev/null; then
+              echo "::error::llama-server exited before becoming healthy."
+              tail -n 100 logs/llama-server.log || true
+              exit 1
+            fi
+            if [[ "$attempt" -eq 180 ]]; then
+              echo "::error::llama-server did not become healthy within 15 minutes."
+              tail -n 100 logs/llama-server.log || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          # Cloudflare Quick Tunnel gives a temporary *.trycloudflare.com URL.
+          # It needs no purchased domain and no tunnel-token secret.
+          cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:${LLAMA_PORT}" \
+            > logs/cloudflared.log 2>&1 &
+          TUNNEL_PID=$!
+          echo "$TUNNEL_PID" > logs/cloudflared.pid
+
+          echo "Waiting for the public Quick Tunnel URL..."
+          PUBLIC_URL=""
+          for attempt in $(seq 1 60); do
+            PUBLIC_URL="$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' logs/cloudflared.log | head -n 1 || true)"
+            if [[ -n "$PUBLIC_URL" ]]; then
+              break
+            fi
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              echo "::error::cloudflared exited before creating a Quick Tunnel."
+              cat logs/cloudflared.log || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [[ -z "$PUBLIC_URL" ]]; then
+            echo "::error::Could not find the Quick Tunnel URL in cloudflared output."
+            cat logs/cloudflared.log || true
             exit 1
           fi
 
-      - name: Start model, verify health, then start tunnel
-        shell: bash
-        run: |
-          chmod +x scripts/start.sh
-          scripts/start.sh
-        env:
-          MODEL_PATH: ${{ env.MODEL_PATH }}
-          LLAMA_PORT: ${{ env.LLAMA_PORT }}
-          LLAMA_CTX_SIZE: ${{ env.LLAMA_CTX_SIZE }}
-          LLAMA_THREADS: ${{ env.LLAMA_THREADS }}
-          LLAMA_BATCH_SIZE: ${{ env.LLAMA_BATCH_SIZE }}
-          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          {
+            echo "## Gemma 4 is ready"
+            echo
+            echo "**Public chat URL:** $PUBLIC_URL"
+            echo
+            echo "This temporary URL works only while this GitHub Actions job is running."
+            echo "Anyone with the URL may be able to access the model; do not share it publicly."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice title=Gemma 4 public URL::$PUBLIC_URL"
+          echo "Quick Tunnel is running. Keeping the GitHub Actions job alive..."
+          wait "$TUNNEL_PID"
 
       - name: Upload service logs if the job fails
         if: failure()
