@@ -1,3 +1,4 @@
+
 name: Run LTX-2.5 ComfyUI on GitHub Actions
 
 on:
@@ -13,9 +14,9 @@ concurrency:
 jobs:
   serve:
     name: Prepare LTX-2.5 and open Cloudflare Quick Tunnel
-    # Requires a GitHub-managed GPU larger runner. Standard ubuntu-latest has no GPU.
-  runs-on: ubuntu-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 350
+
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       COMFY_PORT: "8188"
@@ -32,36 +33,47 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check GPU, RAM, and disk capacity
+      - name: Check available hardware
         shell: bash
         run: |
           set -euo pipefail
+
+          echo "Checking available hardware..."
+          echo "CPU:"
+          nproc
+          echo "RAM:"
+          free -h
+          echo "Disk:"
+          df -h /
+
           if ! command -v nvidia-smi >/dev/null 2>&1; then
-            echo "::error::No NVIDIA GPU found. Standard ubuntu-latest runners cannot run LTX-2.5."
+            echo "::error::No NVIDIA GPU found. Standard GitHub runners cannot generate LTX-2.5 videos."
             exit 1
           fi
+
           nvidia-smi
-          GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)"
+
           GPU_VRAM_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1 | tr -d ' ')"
           RAM_GB="$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)"
           DISK_GB="$(df -BG --output=avail "$GITHUB_WORKSPACE" | tail -n 1 | tr -dc '0-9')"
-          echo "GPU: ${GPU_NAME} (${GPU_VRAM_MB} MiB VRAM)"
-          echo "System RAM: ${RAM_GB} GiB"
-          echo "Free workspace disk: ${DISK_GB} GiB"
+
           if [[ "$GPU_VRAM_MB" -lt 15000 ]]; then
-            echo "::error::This experimental setup requires about 16GB GPU VRAM."
+            echo "::error::At least approximately 16GB GPU VRAM is required for this experimental configuration."
             exit 1
           fi
+
           if [[ "$RAM_GB" -lt 24 ]]; then
-            echo "::error::At least 24 GiB system RAM is required for this low-VRAM attempt."
+            echo "::error::At least 24GB system RAM is required."
             exit 1
           fi
+
           if [[ "$DISK_GB" -lt 100 ]]; then
-            echo "::error::At least 100 GiB free disk space is required."
+            echo "::error::At least 100GB free disk space is required."
             exit 1
           fi
+
           if [[ -z "${HF_TOKEN:-}" ]]; then
-            echo "::error::Add HF_TOKEN as a repository Actions secret and accept LTX-2.5's Hugging Face model terms."
+            echo "::error::Add HF_TOKEN as a repository Actions secret and accept the LTX-2.5 Hugging Face model terms."
             exit 1
           fi
 
@@ -70,7 +82,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends git curl ca-certificates ffmpeg pkg-config
+          sudo apt-get install -y --no-install-recommends \
+            git curl ca-certificates ffmpeg pkg-config
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
 
@@ -78,22 +91,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-          git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
+
+          python -m pip install torch torchvision \
+            --index-url https://download.pytorch.org/whl/cu128
+
+          git clone --depth 1 \
+            https://github.com/comfyanonymous/ComfyUI.git \
+            "$COMFY_DIR"
+
           python -m pip install -r "$COMFY_DIR/requirements.txt"
+
           mkdir -p "$COMFY_DIR/custom_nodes"
-          git clone --depth 1 https://github.com/Lightricks/ComfyUI-LTXVideo.git \
+
+          git clone --depth 1 \
+            https://github.com/Lightricks/ComfyUI-LTXVideo.git \
             "$COMFY_DIR/custom_nodes/ComfyUI-LTXVideo"
-          python -m pip install -r "$COMFY_DIR/custom_nodes/ComfyUI-LTXVideo/requirements.txt"
+
+          python -m pip install \
+            -r "$COMFY_DIR/custom_nodes/ComfyUI-LTXVideo/requirements.txt"
+
           python - <<'PY'
           import torch
+
           print("PyTorch:", torch.__version__)
           print("CUDA available:", torch.cuda.is_available())
+
           if not torch.cuda.is_available():
-              raise SystemExit("CUDA is not available to PyTorch on this runner.")
+              raise SystemExit("CUDA is not available.")
+
           print("GPU:", torch.cuda.get_device_name(0))
-          print("VRAM GiB:", round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2))
+          print(
+              "VRAM GiB:",
+              round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2)
+          )
           PY
 
       - name: Install Hugging Face download tools
@@ -103,58 +135,64 @@ jobs:
           python -m pip install --upgrade huggingface_hub hf_transfer
           hf --help >/dev/null
 
-      - name: Download official LTX-2.5 lower-VRAM model components
+      - name: Download LTX-2.5 model components
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$COMFY_DIR/models/diffusion_models" \
-            "$COMFY_DIR/models/text_encoders" "$COMFY_DIR/models/vae" \
-            "$COMFY_DIR/models/latent_upscale_models" "$COMFY_DIR/models/model_patches"
 
-          # Lightricks' lower-VRAM INT8 ConvRot transformer and matching text encoder.
+          mkdir -p \
+            "$COMFY_DIR/models/diffusion_models" \
+            "$COMFY_DIR/models/text_encoders" \
+            "$COMFY_DIR/models/vae" \
+            "$COMFY_DIR/models/latent_upscale_models" \
+            "$COMFY_DIR/models/model_patches"
+
           hf download Lightricks/LTX-2.5 \
             diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors \
             --local-dir "$COMFY_DIR/models"
+
           hf download Lightricks/LTX-2.5 \
             text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors \
             --local-dir "$COMFY_DIR/models"
 
-          # Lighter convolutional video VAE and audio VAE.
           hf download Lightricks/LTX-2.5 \
             vae/ltx-2.5-video-vae-conv-bf16.safetensors \
             vae/ltx-2.5-audio-vae-bf16.safetensors \
             --local-dir "$COMFY_DIR/models"
 
-          # Supporting components for the official LTX-2.5 templates.
           hf download Lightricks/LTX-2.5 \
             latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
             model_patches/ltx-2.5-duration-head-bf16.safetensors \
             --local-dir "$COMFY_DIR/models"
 
-          # Optional prompt enhancer used by the standard templates.
-          hf download Comfy-Org/gemma-4 gemma4_e2b_it_bf16.safetensors \
+          hf download Comfy-Org/gemma-4 \
+            gemma4_e2b_it_bf16.safetensors \
             --local-dir "$COMFY_DIR/models/text_encoders"
 
           echo "Downloaded model components:"
           find "$COMFY_DIR/models" -type f -printf '%p %k KB\n' | sort
           df -h "$GITHUB_WORKSPACE"
 
-      - name: Install cloudflared
+      - name: Install Cloudflare Tunnel
         shell: bash
         run: |
           set -euo pipefail
+
           curl --fail --location --retry 5 --retry-all-errors \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
             --output /tmp/cloudflared.deb
+
           sudo dpkg -i /tmp/cloudflared.deb
           cloudflared --version
 
-      - name: Start ComfyUI, check health, and start Cloudflare Quick Tunnel
+      - name: Start ComfyUI and Cloudflare Quick Tunnel
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p logs
           cd "$COMFY_DIR"
+
           nohup python main.py \
             --listen 127.0.0.1 \
             --port "$COMFY_PORT" \
@@ -163,46 +201,61 @@ jobs:
             --cpu-vae \
             --disable-auto-launch \
             > "$GITHUB_WORKSPACE/logs/comfyui.log" 2>&1 &
+
           COMFY_PID=$!
           echo "$COMFY_PID" > "$GITHUB_WORKSPACE/logs/comfyui.pid"
 
           echo "Waiting for ComfyUI..."
+
           for attempt in $(seq 1 180); do
-            if curl --silent --fail "http://127.0.0.1:${COMFY_PORT}/system_stats" >/dev/null; then
+            if curl --silent --fail \
+              "http://127.0.0.1:${COMFY_PORT}/system_stats" >/dev/null; then
               echo "ComfyUI is responding."
               break
             fi
+
             if ! kill -0 "$COMFY_PID" 2>/dev/null; then
               echo "::error::ComfyUI exited before becoming ready."
               tail -n 160 "$GITHUB_WORKSPACE/logs/comfyui.log" || true
               exit 1
             fi
+
             if [[ "$attempt" -eq 180 ]]; then
               echo "::error::ComfyUI did not become ready within 15 minutes."
               tail -n 160 "$GITHUB_WORKSPACE/logs/comfyui.log" || true
               exit 1
             fi
+
             sleep 5
           done
 
           cloudflared tunnel --no-autoupdate \
             --url "http://127.0.0.1:${COMFY_PORT}" \
             > "$GITHUB_WORKSPACE/logs/cloudflared.log" 2>&1 &
+
           TUNNEL_PID=$!
           echo "$TUNNEL_PID" > "$GITHUB_WORKSPACE/logs/cloudflared.pid"
 
           PUBLIC_URL=""
+
           for attempt in $(seq 1 60); do
-            PUBLIC_URL="$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+            PUBLIC_URL="$(grep -Eo \
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
               "$GITHUB_WORKSPACE/logs/cloudflared.log" | head -n 1 || true)"
-            if [[ -n "$PUBLIC_URL" ]]; then break; fi
+
+            if [[ -n "$PUBLIC_URL" ]]; then
+              break
+            fi
+
             if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
               echo "::error::Cloudflare Quick Tunnel exited."
               cat "$GITHUB_WORKSPACE/logs/cloudflared.log" || true
               exit 1
             fi
+
             sleep 2
           done
+
           if [[ -z "$PUBLIC_URL" ]]; then
             echo "::error::Could not obtain the Cloudflare Quick Tunnel URL."
             cat "$GITHUB_WORKSPACE/logs/cloudflared.log" || true
@@ -214,19 +267,23 @@ jobs:
             echo
             echo "**ComfyUI URL:** ${PUBLIC_URL}"
             echo
-            echo "Open the Templates panel and choose an LTX-2.5 Text-to-Video or Image-to-Video template."
+            echo "Open ComfyUI Templates and select an LTX-2.5 workflow."
             echo
-            echo "Experimental low-VRAM configuration: generation may still fail on a 16GB T4."
+            echo "This is an experimental low-VRAM configuration. Generation may fail on a 16GB GPU."
             echo
-            echo "The Quick Tunnel URL is accessible to anyone who obtains it. Keep it private and cancel this workflow when finished."
+            echo "Anyone with this temporary URL may access the interface. Keep it private."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice title=LTX-2.5 ComfyUI URL::${PUBLIC_URL}"
-          echo "ComfyUI is live. Keep this workflow running while using the UI."
 
-          while kill -0 "$COMFY_PID" 2>/dev/null && kill -0 "$TUNNEL_PID" 2>/dev/null; do
+          echo "::notice title=LTX-2.5 ComfyUI URL::${PUBLIC_URL}"
+
+          echo "ComfyUI is live. Keeping the workflow running..."
+
+          while kill -0 "$COMFY_PID" 2>/dev/null && \
+                kill -0 "$TUNNEL_PID" 2>/dev/null; do
             sleep 20
           done
-          echo "::error::ComfyUI or Cloudflare tunnel stopped unexpectedly."
+
+          echo "::error::ComfyUI or Cloudflare Tunnel stopped unexpectedly."
           tail -n 160 "$GITHUB_WORKSPACE/logs/comfyui.log" || true
           tail -n 100 "$GITHUB_WORKSPACE/logs/cloudflared.log" || true
           exit 1
