@@ -61,7 +61,7 @@ The deployment follows this sequence:
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/AI-UNLEASHED-LLAMA-CPP-CLOUD.git
+git clone https://github.com/allagoshsystems/AI-UNCENSORED-CLOUD.git
 
 cd AI-UNLEASHED-LLAMA-CPP-CLOUD
 ```
