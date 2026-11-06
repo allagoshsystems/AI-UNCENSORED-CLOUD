@@ -1,76 +1,166 @@
-# Gemma 4 GGUF — GitHub Actions + llama.cpp + Cloudflare Tunnel
+# 🚀 AI UNLEASHED — LLAMA.CPP CLOUD
 
-This repository builds `llama.cpp`, downloads a selected GGUF quant from
-Hugging Face, starts the native llama.cpp server UI, waits for `/health` to
-return HTTP 200, and only then starts the Cloudflare Tunnel.
+### Your AI. Your Models. Your Cloud. No Dedicated Server Required.
 
-## Selected model
+**AI-UNLEASHED-LLAMA-CPP-CLOUD** is an open-source project designed to deploy and access uncensored, open-source AI language models through a cloud-based environment using **GitHub Actions, llama.cpp, and Cloudflare Tunnel**.
 
-- Repository: `HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive`
-- Default quant: `Q4_K_M`
-- File: `Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`
-- Model card: https://huggingface.co/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive
+No complicated server configuration. No need to build a frontend from scratch. Just set up the repository, configure your required settings, launch the workflow, and connect to your AI.
 
-The model card lists Q4_K_M at about 5.0 GB and recommends `--jinja`,
-temperature 1.0, top-p 0.95 and top-k 64. This repo applies those settings.
-The optional mmproj file is not downloaded: this workflow is text-chat first.
+---
 
-## Required GitHub secret
+## ✨ Features
 
-In repository Settings → Secrets and variables → Actions, create:
+- 🤖 **Uncensored AI Models** — Run compatible open-source and uncensored language models.
+- ☁️ **Cloud-Based Deployment** — Launch your AI environment through GitHub Actions.
+- ⚡ **llama.cpp Engine** — Efficient inference using GGUF-compatible models.
+- 🌐 **Public Access** — Expose your running AI server through Cloudflare Tunnel.
+- 💬 **Web Chat Interface** — Access the native llama.cpp chat interface through your browser.
+- 🔧 **Custom Models** — Configure compatible Hugging Face models.
+- 🔄 **Automated Startup** — Automate model initialization, health checks, and tunnel startup.
+- 🆓 **Free-First Design** — Designed to use available free resources where possible.
 
-- `CLOUDFLARE_TUNNEL_TOKEN`: token for a named Cloudflare Tunnel.
-- `HF_TOKEN`: optional; only needed if Hugging Face requires authentication
-  for the repository/file.
+## 🧠 How It Works
 
-Never commit tunnel tokens or Hugging Face tokens.
+The deployment follows this sequence:
 
-## Cloudflare setup
+1. GitHub Actions starts the configured environment.
+2. The workflow installs or initializes llama.cpp.
+3. The selected AI model is downloaded and loaded.
+4. The llama.cpp server starts.
+5. A health check verifies that the AI server is responding.
+6. Cloudflare Tunnel creates a public connection.
+7. Open the generated URL and start chatting with your AI.
 
-1. Create a named tunnel in the Cloudflare Zero Trust dashboard.
-2. Copy its tunnel token into the `CLOUDFLARE_TUNNEL_TOKEN` GitHub secret.
-3. Add a public hostname, e.g. `ai.example.com`.
-4. Set the origin service to `http://127.0.0.1:8080`.
-5. Start the workflow manually from GitHub Actions.
+```text
+          YOU
+           |
+           v
+      GitHub Actions
+           |
+           v
+       AI Runtime
+           |
+           v
+        llama.cpp
+           |
+           v
+     GGUF AI MODEL
+           |
+           v
+      Cloudflare Tunnel
+           |
+           v
+      PUBLIC AI URL
+           |
+           v
+       WEB CHAT UI
+```
 
-The workflow starts llama-server first, checks `http://127.0.0.1:8080/health`,
-and starts cloudflared only after the health check succeeds.
+## 🚀 Getting Started
 
-## Run
+### 1. Clone the Repository
 
-GitHub → Actions → Run Gemma 4 GGUF on GitHub Actions → Run workflow.
+```bash
+git clone https://github.com/YOUR-USERNAME/AI-UNLEASHED-LLAMA-CPP-CLOUD.git
 
-Start with:
-- Context size: `4096`
-- Quantization: `Q4_K_M`
+cd AI-UNLEASHED-LLAMA-CPP-CLOUD
+```
 
-If the runner runs out of disk or RAM, try `IQ4_XS` or `Q3_K_M`, or use a
-larger self-hosted runner. Q4_K_M is still a roughly 5 GB download, so this is
-a heavy workload for standard GitHub-hosted runners.
+### 2. Configure GitHub Secrets
 
-## Important: this is not permanent hosting
+Open your repository:
 
-GitHub-hosted runners are ephemeral and GitHub Actions jobs have a maximum
-runtime. The tunnel and model server are available only while the workflow job
-is alive. The workflow timeout is set to 350 minutes, below the six-hour
-GitHub-hosted job limit. It is for testing/demo sessions, not a 24/7 service.
+**Settings → Secrets and variables → Actions**
 
-For always-on hosting, run the same scripts on a persistent Linux VPS or
-self-hosted runner and keep GitHub Actions as the build/deployment trigger.
+Add the secrets required by your selected deployment workflow.
 
-## Public access warning
+For Cloudflare Tunnel deployments, you will generally need a Cloudflare Tunnel token. Check the workflow configuration for the exact secret name.
 
-The Cloudflare hostname is publicly reachable unless you protect it. Anyone
-who can reach the hostname may be able to use the model and consume CPU/RAM.
-For a public production endpoint, add Cloudflare Access, rate limiting, and
-usage controls. Do not expose an unrestricted inference API unintentionally.
+Never publish your private tokens or API credentials in your repository.
 
-## Notes
+### 3. Enable GitHub Actions
 
-- No GitHub Pages site is used. GitHub Pages cannot execute llama.cpp or host
-  a running Python/C++ inference server.
-- The native chat UI is served by llama.cpp itself; no separate frontend.
-- This workflow builds CPU-only llama.cpp. Standard GitHub-hosted runners do
-  not provide a dedicated GPU for this job.
-- The workflow builds the current llama.cpp default branch. If a later upstream
-  change breaks compatibility, pin the clone to a tested commit.
+1. Open the repository on GitHub.
+2. Navigate to the **Actions** tab.
+3. Allow GitHub Actions if prompted.
+4. Select the available deployment workflow.
+5. Click **Run workflow**.
+
+### 4. Connect to Your AI
+
+Wait for the workflow to download the model, start llama.cpp, pass its health check, and establish the Cloudflare Tunnel.
+
+Once the workflow displays the public URL, open it in your browser.
+
+**That's it. Your AI chat interface is ready!**
+
+---
+
+## 🧩 Model Compatibility
+
+This project is designed around llama.cpp and compatible GGUF models.
+
+You can configure different models depending on available memory and hardware.
+
+Potential model families include:
+
+- Llama
+- Gemma
+- Qwen
+- Mistral
+- DeepSeek
+- Other compatible GGUF models
+
+Model availability, quantization, and hardware requirements depend on your selected configuration.
+
+## ⚙️ Customization
+
+You can customize:
+
+- Hugging Face model repository
+- Model filename
+- GGUF quantization
+- Context size
+- GPU layers and CPU offloading
+- Server configuration
+- Cloudflare Tunnel settings
+
+Refer to the workflow files and configuration included in this repository.
+
+## ⚠️ Important Notes
+
+- GitHub Actions coordinates the deployment; it does not automatically provide a free GPU.
+- Standard GitHub-hosted runners are generally CPU-only. GPU execution requires an available GPU-enabled environment.
+- Free GitHub Actions usage and execution limits depend on your account and runner type.
+- Cloudflare Tunnel URLs are available only while the tunnel and underlying server are running.
+- Large AI models require sufficient RAM, VRAM, storage, and download time.
+- Some models may have their own licenses and usage restrictions. Check the model publisher's license before use.
+
+## 🔐 Privacy & Security
+
+- Keep Cloudflare tokens and other credentials in GitHub Secrets.
+- Do not commit private API keys or access tokens.
+- Review the license and security requirements of every model you deploy.
+- Only expose services you intend to make publicly accessible.
+
+## 📜 Disclaimer
+
+This repository is an AI deployment and inference project. It does not host or claim ownership of third-party AI models.
+
+Users are responsible for complying with applicable laws, model licenses, and the policies of the services they use.
+
+## ⭐ Support the Project
+
+If you find this project useful:
+
+- ⭐ Star this repository.
+- 🍴 Fork it.
+- 🛠️ Contribute improvements.
+- 🐛 Report bugs and issues.
+- 💡 Share compatible models and configurations.
+
+---
+
+### Built for people who want more control over their AI.
+
+**AI UNLEASHED — Your Models. Your Rules. Your Cloud.**
