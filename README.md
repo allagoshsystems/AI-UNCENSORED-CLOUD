@@ -63,7 +63,7 @@ The deployment follows this sequence:
 ```bash
 git clone https://github.com/allagoshsystems/AI-UNCENSORED-CLOUD.git
 
-cd AI-UNLEASHED-LLAMA-CPP-CLOUD
+cd AI-UNCENSORED-LLAMA-CPP-CLOUD
 ```
 
 ### 2. Configure GitHub Secrets
