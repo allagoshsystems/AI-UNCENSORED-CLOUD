@@ -1,10 +1,11 @@
+
 name: Run Gemma 4 GGUF on GitHub Actions
 
 on:
   workflow_dispatch:
     inputs:
       context_size:
-        description: "Context size (start with 4096 on a standard runner)"
+        description: "Model context size"
         required: true
         default: "4096"
       quantization:
@@ -20,33 +21,39 @@ on:
 permissions:
   contents: read
 
-# A new run replaces the previous run for this repository.
 concurrency:
   group: gemma4-public-server
   cancel-in-progress: true
 
 jobs:
   serve:
-    name: Build, load Gemma 4, then open Cloudflare Tunnel
+    name: Restore Data, Start Gemma 4 and Public Tunnel
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
     env:
       MODEL_REPO: HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive
       MODEL_PREFIX: Gemma-4-E4B-Uncensored-HauhauCS-Aggressive
-      MODEL_PATH: ${{ github.workspace }}/models/model.gguf
+
+      DATA_DIR: ${{ github.workspace }}/data
+      MODEL_PATH: ${{ github.workspace }}/data/models/model.gguf
+      LLAMA_SERVER: ${{ github.workspace }}/data/bin/llama-server
+
       LLAMA_PORT: "8080"
-      LLAMA_CTX_SIZE: ${{ inputs.context_size }}
       LLAMA_THREADS: "4"
       LLAMA_BATCH_SIZE: "128"
+
+      CACHE_VERSION: "v1"
+
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
 
     steps:
+      # 1. Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show runner resources
+      # 2. Runner resources
+      - name: Check runner resources
         shell: bash
         run: |
           set -e
@@ -57,92 +64,335 @@ jobs:
           echo "Disk:"
           df -h /
 
-      - name: Install build and runtime dependencies
+      # 3. Restore data cache
+      - name: Restore data cache
+        id: data-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: gemma4-${{ env.CACHE_VERSION }}-${{ inputs.quantization }}-ubuntu
+
+      # 4. Install dependencies
+      - name: Install dependencies
         shell: bash
         run: |
+          set -euo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake git libcurl4-openssl-dev \
-            pkg-config curl ca-certificates
+            build-essential \
+            cmake \
+            git \
+            libcurl4-openssl-dev \
+            pkg-config \
+            curl \
+            ca-certificates \
+            jq
+
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
 
-      - name: Build llama.cpp server
+      # 5. Prepare data folders
+      - name: Prepare data directory
         shell: bash
         run: |
-          set -euxo pipefail
-          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
-          cmake -S llama.cpp -B llama.cpp/build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DGGML_NATIVE=OFF \
-            -DGGML_CURL=ON
-          cmake --build llama.cpp/build \
-            --config Release \
-            --target llama-server \
-            -j2
-          test -x llama.cpp/build/bin/llama-server
-          llama.cpp/build/bin/llama-server --version
+          mkdir -p \
+            data/models \
+            data/bin \
+            data/config \
+            data/cloudflare \
+            data/conversations \
+            data/logs
 
-      - name: Download selected GGUF from Hugging Face
+      # 6. Validate cache
+      - name: Validate existing data
+        id: validate
         shell: bash
         env:
           QUANT: ${{ inputs.quantization }}
         run: |
           set -euo pipefail
-          mkdir -p models
+
+          VALID=true
+
+          test -s "$MODEL_PATH" || VALID=false
+          test -x "$LLAMA_SERVER" || VALID=false
+          test -x "$DATA_DIR/bin/cloudflared" || VALID=false
+          test -s "$DATA_DIR/config/model.json" || VALID=false
+          test -s "$DATA_DIR/config/cloudflare.json" || VALID=false
+          test -s "$DATA_DIR/manifest.json" || VALID=false
+
+          if [[ "$VALID" == "true" ]]; then
+
+            STORED_QUANT=$(jq -r '.quantization // empty' \
+              "$DATA_DIR/manifest.json")
+
+            [[ "$STORED_QUANT" == "$QUANT" ]] || VALID=false
+
+          fi
+
+          if [[ "$VALID" == "true" ]]; then
+
+            # Verify GGUF file signature
+            MAGIC=$(head -c 4 "$MODEL_PATH")
+
+            [[ "$MAGIC" == "GGUF" ]] || VALID=false
+
+          fi
+
+          if [[ "$VALID" == "true" ]]; then
+
+            "$LLAMA_SERVER" --version
+            "$DATA_DIR/bin/cloudflared" --version
+
+            echo "data_valid=true" >> "$GITHUB_OUTPUT"
+
+            echo "=================================="
+            echo "VALID DATA FOUND"
+            echo "Reusing existing model."
+            echo "=================================="
+
+            du -sh data
+            ls -lh "$MODEL_PATH"
+
+          else
+
+            if [[ "${{ steps.data-cache.outputs.cache-hit }}" == "true" ]]; then
+              echo "::error::Invalid cached data. Change CACHE_VERSION to force a rebuild."
+              exit 1
+            fi
+
+            echo "data_valid=false" >> "$GITHUB_OUTPUT"
+            echo "No valid cache. Initializing installation."
+
+          fi
+
+      # 7. Download GGUF
+      - name: Download Gemma 4 GGUF
+        if: steps.validate.outputs.data_valid != 'true'
+        shell: bash
+        env:
+          QUANT: ${{ inputs.quantization }}
+        run: |
+          set -euo pipefail
+
           FILE="${MODEL_PREFIX}-${QUANT}.gguf"
+
           URL="https://huggingface.co/${MODEL_REPO}/resolve/main/${FILE}?download=true"
 
+          echo "Downloading: $FILE"
+
           if [[ -n "${HF_TOKEN:-}" ]]; then
-            curl --fail --location --retry 5 --retry-all-errors \
+
+            curl --fail --location \
+              --retry 5 --retry-all-errors \
               --header "Authorization: Bearer ${HF_TOKEN}" \
-              "$URL" --output "$MODEL_PATH"
+              "$URL" \
+              --output "$MODEL_PATH"
+
           else
-            curl --fail --location --retry 5 --retry-all-errors \
-              "$URL" --output "$MODEL_PATH"
+
+            curl --fail --location \
+              --retry 5 --retry-all-errors \
+              "$URL" \
+              --output "$MODEL_PATH"
+
           fi
 
           test -s "$MODEL_PATH"
-          echo "Downloaded:"
-          ls -lh "$MODEL_PATH"
-          df -h /
 
-      - name: Install cloudflared
+          [[ "$(head -c 4 "$MODEL_PATH")" == "GGUF" ]]
+
+          echo "Model downloaded successfully."
+          ls -lh "$MODEL_PATH"
+
+      # 8. Build llama.cpp
+      - name: Build llama.cpp
+        if: steps.validate.outputs.data_valid != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail --location --retry 5 \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
-            --output /tmp/cloudflared.deb
-          sudo dpkg -i /tmp/cloudflared.deb
-          cloudflared --version
 
-      - name: Validate Cloudflare token
+          git clone --depth 1 \
+            https://github.com/ggml-org/llama.cpp.git \
+            data/llama.cpp
+
+          cmake -S data/llama.cpp \
+            -B data/llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CURL=ON
+
+          cmake --build data/llama.cpp/build \
+            --config Release \
+            --target llama-server \
+            -j2
+
+          cp data/llama.cpp/build/bin/llama-server \
+            data/bin/llama-server
+
+          chmod +x data/bin/llama-server
+
+          data/bin/llama-server --version
+
+      # 9. Install Cloudflare Quick Tunnel
+      - name: Install Cloudflared
+        if: steps.validate.outputs.data_valid != 'true'
         shell: bash
         run: |
-          if [[ -z "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]]; then
-            echo "::error::Missing CLOUDFLARE_TUNNEL_TOKEN repository secret."
-            exit 1
-          fi
+          set -euo pipefail
 
-      - name: Start model, verify health, then start tunnel
+          curl --fail --location --retry 5 \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            --output data/bin/cloudflared
+
+          chmod +x data/bin/cloudflared
+
+          data/bin/cloudflared --version
+
+      # 10. Model configuration
+      - name: Create model configuration
+        if: steps.validate.outputs.data_valid != 'true'
+        shell: bash
+        env:
+          QUANT: ${{ inputs.quantization }}
+          CONTEXT_SIZE: ${{ inputs.context_size }}
+        run: |
+          jq -n \
+            --arg repo "$MODEL_REPO" \
+            --arg quant "$QUANT" \
+            --argjson context "$CONTEXT_SIZE" \
+            '{
+              name: "Gemma 4 Uncensored",
+              repository: $repo,
+              quantization: $quant,
+              file: "models/model.gguf",
+              engine: "llama.cpp",
+              server: {
+                host: "0.0.0.0",
+                port: 8080,
+                context_size: $context,
+                threads: 4,
+                batch_size: 128
+              }
+            }' > data/config/model.json
+
+      # 11. Cloudflare configuration
+      - name: Create Cloudflare configuration
+        if: steps.validate.outputs.data_valid != 'true'
+        run: |
+          cat > data/config/cloudflare.json <<'EOF'
+          {
+            "type": "quick-tunnel",
+            "enabled": true,
+            "service": "http://localhost:8080",
+            "automatic_url": true,
+            "domain_required": false,
+            "authentication_token_required": false
+          }
+          EOF
+
+          cat > data/cloudflare/README.md <<'EOF'
+          # Cloudflare Quick Tunnel
+
+          Automatically generates a temporary
+          trycloudflare.com public URL.
+
+          No domain or Cloudflare account token
+          is required for this Quick Tunnel.
+          EOF
+
+      # 12. Conversations directory
+      - name: Initialize conversations
+        if: steps.validate.outputs.data_valid != 'true'
+        run: |
+          cat > data/conversations/README.md <<'EOF'
+          # Conversations
+
+          Reserved for conversation exports and
+          future server-side chat persistence.
+
+          The standard llama.cpp browser UI does
+          not automatically write chats here.
+          EOF
+
+      # 13. Generate manifest
+      - name: Create data manifest
+        if: steps.validate.outputs.data_valid != 'true'
+        shell: bash
+        env:
+          QUANT: ${{ inputs.quantization }}
+        run: |
+          jq -n \
+            --arg repo "$MODEL_REPO" \
+            --arg quant "$QUANT" \
+            --arg version "$CACHE_VERSION" \
+            '{
+              version: 1,
+              cache_version: $version,
+              model_repository: $repo,
+              quantization: $quant,
+              engine: "llama.cpp",
+              files: [
+                "models/model.gguf",
+                "bin/llama-server",
+                "bin/cloudflared",
+                "config/model.json",
+                "config/cloudflare.json"
+              ]
+            }' > data/manifest.json
+
+      # 14. Validate complete data
+      - name: Verify data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s "$MODEL_PATH"
+          test -x "$LLAMA_SERVER"
+          test -x "$DATA_DIR/bin/cloudflared"
+
+          [[ "$(head -c 4 "$MODEL_PATH")" == "GGUF" ]]
+
+          jq empty data/manifest.json
+          jq empty data/config/model.json
+          jq empty data/config/cloudflare.json
+
+          echo "All data is valid."
+          echo "Data size:"
+          du -sh data
+
+      # 15. Save data cache
+      - name: Save data cache
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: gemma4-${{ env.CACHE_VERSION }}-${{ inputs.quantization }}-ubuntu
+
+      # 16. Start AI and automatic public tunnel
+      - name: Start Gemma 4 and Public Tunnel
         shell: bash
         run: |
           chmod +x scripts/start.sh
           scripts/start.sh
         env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          DATA_DIR: ${{ env.DATA_DIR }}
           MODEL_PATH: ${{ env.MODEL_PATH }}
+          LLAMA_SERVER: ${{ env.LLAMA_SERVER }}
           LLAMA_PORT: ${{ env.LLAMA_PORT }}
-          LLAMA_CTX_SIZE: ${{ env.LLAMA_CTX_SIZE }}
+          LLAMA_CTX_SIZE: ${{ inputs.context_size }}
           LLAMA_THREADS: ${{ env.LLAMA_THREADS }}
           LLAMA_BATCH_SIZE: ${{ env.LLAMA_BATCH_SIZE }}
-          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
 
-      - name: Upload service logs if the job fails
+      # 17. Save logs if anything fails
+      - name: Upload service logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: gemma4-server-logs
-          path: logs/
+          path: data/logs/
           if-no-files-found: ignore
           retention-days: 3
