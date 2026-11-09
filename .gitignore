@@ -1,0 +1,29 @@
+
+# Large model files
+/data/models/*
+
+# Compiled executables
+/data/bin/*
+
+# llama.cpp source and build
+/data/llama.cpp/
+
+# Runtime logs
+/data/logs/*
+
+# Private conversation exports
+/data/conversations/*
+
+# Secrets
+.env
+.env.*
+*.token
+secrets.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Temporary files
+*.tmp
+*.part
