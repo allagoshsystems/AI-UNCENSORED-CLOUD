@@ -1,108 +1,202 @@
+
 #!/usr/bin/env bash
+
 set -Eeuo pipefail
 
-mkdir -p logs
+# ==========================================
+# CONFIGURATION
+# ==========================================
 
-SERVER_PID=""
+DATA_DIR="${DATA_DIR:-${GITHUB_WORKSPACE:-.}/data}"
+
+MODEL_PATH="${MODEL_PATH:-$DATA_DIR/models/model.gguf}"
+LLAMA_SERVER="${LLAMA_SERVER:-$DATA_DIR/bin/llama-server}"
+
+LLAMA_PORT="${LLAMA_PORT:-8080}"
+LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-4096}"
+LLAMA_THREADS="${LLAMA_THREADS:-4}"
+LLAMA_BATCH_SIZE="${LLAMA_BATCH_SIZE:-128}"
+
+CLOUDFLARED="$DATA_DIR/bin/cloudflared"
+LOG_DIR="$DATA_DIR/logs"
+
+mkdir -p "$LOG_DIR"
+
+LLAMA_PID=""
 TUNNEL_PID=""
 
+# ==========================================
+# CLEANUP
+# ==========================================
+
 cleanup() {
-  echo "Cleaning up background processes..."
-  if [[ -n "${TUNNEL_PID}" ]]; then
-    kill "${TUNNEL_PID}" 2>/dev/null || true
-  fi
-  if [[ -n "${SERVER_PID}" ]]; then
-    kill "${SERVER_PID}" 2>/dev/null || true
-  fi
-  wait 2>/dev/null || true
+    echo "Stopping services..."
+
+    if [[ -n "$TUNNEL_PID" ]]; then
+        kill "$TUNNEL_PID" 2>/dev/null || true
+    fi
+
+    if [[ -n "$LLAMA_PID" ]]; then
+        kill "$LLAMA_PID" 2>/dev/null || true
+    fi
+
+    wait 2>/dev/null || true
 }
+
 trap cleanup EXIT INT TERM
 
-: "${MODEL_PATH:?MODEL_PATH is required}"
-: "${LLAMA_PORT:=8080}"
-: "${LLAMA_CTX_SIZE:=4096}"
-: "${LLAMA_THREADS:=4}"
-: "${LLAMA_BATCH_SIZE:=128}"
-: "${CLOUDFLARE_TUNNEL_TOKEN:?CLOUDFLARE_TUNNEL_TOKEN is required}"
+# ==========================================
+# VALIDATE
+# ==========================================
 
-SERVER_BIN="./llama.cpp/build/bin/llama-server"
-if [[ ! -x "$SERVER_BIN" ]]; then
-  echo "Missing llama-server binary: $SERVER_BIN"
-  exit 1
-fi
-if [[ ! -s "$MODEL_PATH" ]]; then
-  echo "GGUF model is missing or empty: $MODEL_PATH"
-  exit 1
-fi
+echo "=========================================="
+echo "          GEMMA 4 AI CLOUD"
+echo "=========================================="
 
-echo "Starting Gemma 4 model server on 127.0.0.1:${LLAMA_PORT}"
-"$SERVER_BIN" \
-  --model "$MODEL_PATH" \
-  --host 127.0.0.1 \
-  --port "$LLAMA_PORT" \
-  --ctx-size "$LLAMA_CTX_SIZE" \
-  --threads "$LLAMA_THREADS" \
-  --batch-size "$LLAMA_BATCH_SIZE" \
-  --jinja \
-  --temp 1.0 \
-  --top-p 0.95 \
-  --top-k 64 \
-  --parallel 1 \
-  > logs/llama-server.log 2>&1 &
-SERVER_PID=$!
+test -s "$MODEL_PATH"
+test -x "$LLAMA_SERVER"
+test -x "$CLOUDFLARED"
 
-echo "Waiting for llama.cpp health endpoint..."
-READY=0
-for attempt in $(seq 1 180); do
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo "llama-server exited before becoming healthy."
-    tail -n 150 logs/llama-server.log || true
-    exit 1
-  fi
+[[ "$(head -c 4 "$MODEL_PATH")" == "GGUF" ]]
 
-  HTTP_CODE="$(curl --silent --output /dev/null \
-    --write-out '%{http_code}' \
-    "http://127.0.0.1:${LLAMA_PORT}/health" || true)"
+echo "Model: Gemma 4"
+echo "Engine: llama.cpp"
+echo "Context: $LLAMA_CTX_SIZE"
+echo "Port: $LLAMA_PORT"
 
-  if [[ "$HTTP_CODE" == "200" ]]; then
-    READY=1
-    break
-  fi
+# ==========================================
+# START LLAMA SERVER
+# ==========================================
 
-  if (( attempt % 12 == 0 )); then
-    echo "Still waiting (attempt ${attempt}/180; HTTP ${HTTP_CODE:-no response})..."
-  fi
-  sleep 5
+echo
+echo "Starting llama.cpp server..."
+
+"$LLAMA_SERVER" \
+    --model "$MODEL_PATH" \
+    --host 0.0.0.0 \
+    --port "$LLAMA_PORT" \
+    --ctx-size "$LLAMA_CTX_SIZE" \
+    --threads "$LLAMA_THREADS" \
+    --batch-size "$LLAMA_BATCH_SIZE" \
+    > "$LOG_DIR/llama.log" 2>&1 &
+
+LLAMA_PID=$!
+
+# ==========================================
+# HEALTH CHECK
+# ==========================================
+
+echo
+echo "Waiting for Gemma 4 to become ready..."
+
+HEALTHY=false
+
+for i in $(seq 1 180); do
+
+    if curl --silent --fail \
+        "http://127.0.0.1:${LLAMA_PORT}/health" \
+        >/dev/null; then
+
+        HEALTHY=true
+        break
+    fi
+
+    if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
+        echo "ERROR: llama.cpp exited."
+        cat "$LOG_DIR/llama.log"
+        exit 1
+    fi
+
+    echo "Health check $i/180"
+    sleep 5
+
 done
 
-if [[ "$READY" != "1" ]]; then
-  echo "Model did not become healthy within 15 minutes."
-  tail -n 200 logs/llama-server.log || true
-  exit 1
+if [[ "$HEALTHY" != "true" ]]; then
+    echo "ERROR: Model health check timed out."
+    cat "$LOG_DIR/llama.log"
+    exit 1
 fi
 
-echo "Model is healthy. Starting Cloudflare Tunnel now."
-cloudflared tunnel --no-autoupdate run \
-  --token "$CLOUDFLARE_TUNNEL_TOKEN" \
-  > logs/cloudflared.log 2>&1 &
+echo
+echo "=========================================="
+echo "          GEMMA 4 IS READY"
+echo "=========================================="
+
+# ==========================================
+# START CLOUDFLARE QUICK TUNNEL
+# ==========================================
+
+echo
+echo "Starting Cloudflare Quick Tunnel..."
+
+"$CLOUDFLARED" tunnel \
+    --url "http://127.0.0.1:${LLAMA_PORT}" \
+    --no-autoupdate \
+    > "$LOG_DIR/cloudflared.log" 2>&1 &
+
 TUNNEL_PID=$!
 
-sleep 5
-if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-  echo "cloudflared exited during startup."
-  tail -n 100 logs/cloudflared.log || true
-  exit 1
-fi
+# ==========================================
+# EXTRACT AUTOMATIC PUBLIC URL
+# ==========================================
 
-echo "Both services are running."
-echo "Configure the Cloudflare public hostname service as http://127.0.0.1:${LLAMA_PORT}"
-echo "The native llama.cpp web UI is served by llama-server itself."
+echo
+echo "Waiting for Cloudflare public URL..."
 
-while kill -0 "$SERVER_PID" 2>/dev/null && kill -0 "$TUNNEL_PID" 2>/dev/null; do
-  sleep 10
+PUBLIC_URL=""
+
+for i in $(seq 1 90); do
+
+    PUBLIC_URL=$(
+        grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+            "$LOG_DIR/cloudflared.log" |
+        head -n 1 || true
+    )
+
+    if [[ -n "$PUBLIC_URL" ]]; then
+        break
+    fi
+
+    if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        echo "ERROR: Cloudflare tunnel stopped."
+        cat "$LOG_DIR/cloudflared.log"
+        exit 1
+    fi
+
+    sleep 2
+
 done
 
-echo "A service exited unexpectedly."
-tail -n 100 logs/llama-server.log || true
-tail -n 100 logs/cloudflared.log || true
-exit 1
+# ==========================================
+# VERIFY PUBLIC URL
+# ==========================================
+
+if [[ -z "$PUBLIC_URL" ]]; then
+    echo "ERROR: Unable to obtain Cloudflare URL."
+    cat "$LOG_DIR/cloudflared.log"
+    exit 1
+fi
+
+# ==========================================
+# DISPLAY URL
+# ==========================================
+
+echo
+echo "=========================================="
+echo "          GEMMA 4 PUBLIC CHAT"
+echo "=========================================="
+
+echo "PUBLIC URL: $PUBLIC_URL"
+
+echo "MODEL: GEMMA 4 UNCENSORED"
+echo "ENGINE: LLAMA.CPP"
+echo "STATUS: RUNNING"
+
+echo "=========================================="
+
+# GitHub Actions clickable annotation
+echo "::notice title=Gemma 4 Public Chat::$PUBLIC_URL"
+
+# Keep runner alive
+wait "$TUNNEL_PID"
