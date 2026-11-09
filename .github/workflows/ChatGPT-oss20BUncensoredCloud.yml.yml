@@ -5,9 +5,10 @@ on:
   workflow_dispatch:
     inputs:
       context_size:
-        description: "Context size (model recommends minimum 8192)"
+        description: "Context size (recommended minimum 8192)"
         required: true
         default: "8192"
+
       quantization:
         description: "GGUF quantization"
         required: true
@@ -25,202 +26,449 @@ concurrency:
 
 jobs:
   serve:
-    name: Build, load GPT-oss 20B, then open Cloudflare Quick Tunnel
+    name: Restore Data, Start GPT-oss 20B and Public Tunnel
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
     env:
       MODEL_REPO: DavidAU/OpenAi-GPT-oss-20b-HERETIC-uncensored-NEO-Imatrix-gguf
       MODEL_FILE: OpenAI-20B-NEO-CODEPlus-Uncensored-IQ4_NL.gguf
-      MODEL_PATH: ${{ github.workspace }}/models/model.gguf
+
+      DATA_DIR: ${{ github.workspace }}/data
+      MODEL_PATH: ${{ github.workspace }}/data/models/model.gguf
+      LLAMA_SERVER: ${{ github.workspace }}/data/bin/llama-server
+
       LLAMA_PORT: "8080"
-      LLAMA_CTX_SIZE: ${{ inputs.context_size }}
       LLAMA_THREADS: "4"
       LLAMA_BATCH_SIZE: "128"
+
+      CACHE_VERSION: "v1"
+
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
     steps:
+
+      # ==========================================
+      # 1. CHECKOUT
+      # ==========================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show runner resources
+      # ==========================================
+      # 2. RUNNER INFORMATION
+      # ==========================================
+
+      - name: Check runner resources
         shell: bash
         run: |
           set -e
+
           echo "CPU:"
           nproc
-          echo "Memory:"
+
+          echo "MEMORY:"
           free -h
-          echo "Disk:"
+
+          echo "DISK:"
           df -h /
 
-      - name: Install build and runtime dependencies
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake git libcurl4-openssl-dev \
-            pkg-config curl ca-certificates
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
+      # ==========================================
+      # 3. RESTORE PERSISTENT DATA
+      # ==========================================
 
-      - name: Build llama.cpp server
-        shell: bash
-        run: |
-          set -euxo pipefail
-          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
-          cmake -S llama.cpp -B llama.cpp/build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DGGML_NATIVE=OFF \
-            -DGGML_CURL=ON
-          cmake --build llama.cpp/build \
-            --config Release \
-            --target llama-server \
-            -j2
-          test -x llama.cpp/build/bin/llama-server
-          llama.cpp/build/bin/llama-server --version
+      - name: Restore data cache
+        id: data-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: gpt-oss-20b-${{ env.CACHE_VERSION }}-${{ inputs.quantization }}-ubuntu
 
-      - name: Download GPT-oss 20B GGUF from Hugging Face
+      # ==========================================
+      # 4. INSTALL DEPENDENCIES
+      # ==========================================
+
+      - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p models
+
+          sudo apt-get update
+
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            git \
+            libcurl4-openssl-dev \
+            pkg-config \
+            curl \
+            ca-certificates \
+            jq
+
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      # ==========================================
+      # 5. PREPARE DATA DIRECTORY
+      # ==========================================
+
+      - name: Prepare data directory
+        shell: bash
+        run: |
+          mkdir -p \
+            data/models \
+            data/bin \
+            data/config \
+            data/cloudflare \
+            data/conversations \
+            data/logs
+
+      # ==========================================
+      # 6. VALIDATE EXISTING DATA
+      # ==========================================
+
+      - name: Validate cached data
+        id: validate
+        shell: bash
+        env:
+          QUANT: ${{ inputs.quantization }}
+        run: |
+          set -euo pipefail
+
+          VALID=true
+
+          test -s "$MODEL_PATH" || VALID=false
+          test -x "$LLAMA_SERVER" || VALID=false
+          test -x "$DATA_DIR/bin/cloudflared" || VALID=false
+          test -s "$DATA_DIR/config/model.json" || VALID=false
+          test -s "$DATA_DIR/config/cloudflare.json" || VALID=false
+          test -s "$DATA_DIR/manifest.json" || VALID=false
+
+          if [[ "$VALID" == "true" ]]; then
+
+            STORED_QUANT=$(jq -r '.quantization // empty' \
+              "$DATA_DIR/manifest.json")
+
+            STORED_REPO=$(jq -r '.model_repository // empty' \
+              "$DATA_DIR/manifest.json")
+
+            STORED_FILE=$(jq -r '.model_file // empty' \
+              "$DATA_DIR/manifest.json")
+
+            [[ "$STORED_QUANT" == "$QUANT" ]] || VALID=false
+            [[ "$STORED_REPO" == "$MODEL_REPO" ]] || VALID=false
+            [[ "$STORED_FILE" == "$MODEL_FILE" ]] || VALID=false
+
+          fi
+
+          if [[ "$VALID" == "true" ]]; then
+
+            MAGIC=$(head -c 4 "$MODEL_PATH")
+
+            [[ "$MAGIC" == "GGUF" ]] || VALID=false
+
+          fi
+
+          if [[ "$VALID" == "true" ]]; then
+
+            "$LLAMA_SERVER" --version
+            "$DATA_DIR/bin/cloudflared" --version
+
+            echo "data_valid=true" >> "$GITHUB_OUTPUT"
+
+            echo "======================================"
+            echo "VALID GPT-OSS DATA FOUND"
+            echo "Using cached model and executables."
+            echo "======================================"
+
+            du -sh data
+            ls -lh "$MODEL_PATH"
+
+          else
+
+            if [[ "${{ steps.data-cache.outputs.cache-hit }}" == "true" ]]; then
+              echo "::error::Cached data is invalid. Change CACHE_VERSION to force a clean installation."
+              exit 1
+            fi
+
+            echo "data_valid=false" >> "$GITHUB_OUTPUT"
+
+            echo "No valid data cache found."
+            echo "Preparing first installation."
+
+          fi
+
+      # ==========================================
+      # 7. DOWNLOAD GPT-OSS GGUF
+      # ==========================================
+
+      - name: Download GPT-oss 20B GGUF
+        if: steps.validate.outputs.data_valid != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
 
           URL="https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FILE}?download=true"
 
-          echo "Downloading: ${MODEL_FILE}"
+          echo "Downloading GPT-oss 20B..."
+          echo "Repository: $MODEL_REPO"
+          echo "File: $MODEL_FILE"
 
           if [[ -n "${HF_TOKEN:-}" ]]; then
-            curl --fail --location --retry 5 --retry-all-errors \
+
+            curl --fail --location \
+              --retry 5 \
+              --retry-all-errors \
               --header "Authorization: Bearer ${HF_TOKEN}" \
-              "$URL" --output "$MODEL_PATH"
+              "$URL" \
+              --output "$MODEL_PATH"
+
           else
-            curl --fail --location --retry 5 --retry-all-errors \
-              "$URL" --output "$MODEL_PATH"
+
+            curl --fail --location \
+              --retry 5 \
+              --retry-all-errors \
+              "$URL" \
+              --output "$MODEL_PATH"
+
           fi
 
           test -s "$MODEL_PATH"
 
-          echo "Downloaded model:"
+          [[ "$(head -c 4 "$MODEL_PATH")" == "GGUF" ]]
+
+          echo "Download completed."
+
           ls -lh "$MODEL_PATH"
-          echo "Disk after download:"
           df -h /
 
-      - name: Install cloudflared
+      # ==========================================
+      # 8. BUILD LLAMA.CPP
+      # ==========================================
+
+      - name: Build llama.cpp server
+        if: steps.validate.outputs.data_valid != 'true'
         shell: bash
         run: |
           set -euo pipefail
+
+          git clone --depth 1 \
+            https://github.com/ggml-org/llama.cpp.git \
+            data/llama.cpp
+
+          cmake -S data/llama.cpp \
+            -B data/llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CURL=ON
+
+          cmake --build data/llama.cpp/build \
+            --config Release \
+            --target llama-server \
+            -j2
+
+          cp data/llama.cpp/build/bin/llama-server \
+            data/bin/llama-server
+
+          chmod +x data/bin/llama-server
+
+          data/bin/llama-server --version
+
+      # ==========================================
+      # 9. INSTALL CLOUDFLARED
+      # ==========================================
+
+      - name: Install Cloudflare Quick Tunnel
+        if: steps.validate.outputs.data_valid != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
           curl --fail --location --retry 5 \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
-            --output /tmp/cloudflared.deb
-          sudo dpkg -i /tmp/cloudflared.deb
-          cloudflared --version
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            --output data/bin/cloudflared
 
-      - name: Start GPT-oss 20B, verify health, then start free Quick Tunnel
+          chmod +x data/bin/cloudflared
+
+          data/bin/cloudflared --version
+
+      # ==========================================
+      # 10. MODEL CONFIGURATION
+      # ==========================================
+
+      - name: Create GPT-oss model configuration
+        if: steps.validate.outputs.data_valid != 'true'
+        shell: bash
+        env:
+          QUANT: ${{ inputs.quantization }}
+          CONTEXT_SIZE: ${{ inputs.context_size }}
+        run: |
+          jq -n \
+            --arg repo "$MODEL_REPO" \
+            --arg file "$MODEL_FILE" \
+            --arg quant "$QUANT" \
+            --argjson context "$CONTEXT_SIZE" \
+            '{
+              name: "GPT-oss 20B NEO CODEPlus Uncensored",
+              repository: $repo,
+              model_file: $file,
+              quantization: $quant,
+              engine: "llama.cpp",
+              file: "models/model.gguf",
+              server: {
+                host: "127.0.0.1",
+                port: 8080,
+                context_size: $context,
+                threads: 4,
+                batch_size: 128,
+                parallel: 1,
+                jinja: true,
+                temperature: 0.6,
+                top_p: 0.95,
+                top_k: 40,
+                min_p: 0.05,
+                repeat_penalty: 1.1
+              }
+            }' > data/config/model.json
+
+      # ==========================================
+      # 11. CLOUDFLARE CONFIGURATION
+      # ==========================================
+
+      - name: Create Cloudflare configuration
+        if: steps.validate.outputs.data_valid != 'true'
+        shell: bash
+        run: |
+          cat > data/config/cloudflare.json <<'EOF'
+          {
+            "type": "quick-tunnel",
+            "enabled": true,
+            "service": "http://127.0.0.1:8080",
+            "automatic_url": true,
+            "domain_required": false,
+            "authentication_token_required": false
+          }
+          EOF
+
+          cat > data/cloudflare/README.md <<'EOF'
+          # Cloudflare Quick Tunnel
+
+          Generates a temporary public trycloudflare.com URL.
+
+          No custom domain or Cloudflare tunnel token required.
+          EOF
+
+      # ==========================================
+      # 12. CONVERSATION CONFIGURATION
+      # ==========================================
+
+      - name: Initialize conversations
+        if: steps.validate.outputs.data_valid != 'true'
+        run: |
+          cat > data/conversations/README.md <<'EOF'
+          # GPT-oss Conversations
+
+          Reserved for exported conversations and future
+          server-side conversation persistence.
+
+          Browser chat history is not automatically
+          saved to this directory by llama.cpp.
+          EOF
+
+      # ==========================================
+      # 13. DATA MANIFEST
+      # ==========================================
+
+      - name: Generate data manifest
+        if: steps.validate.outputs.data_valid != 'true'
+        shell: bash
+        env:
+          QUANT: ${{ inputs.quantization }}
+        run: |
+          jq -n \
+            --arg repo "$MODEL_REPO" \
+            --arg file "$MODEL_FILE" \
+            --arg quant "$QUANT" \
+            --arg version "$CACHE_VERSION" \
+            '{
+              version: 1,
+              cache_version: $version,
+              model_repository: $repo,
+              model_file: $file,
+              quantization: $quant,
+              engine: "llama.cpp",
+              files: [
+                "models/model.gguf",
+                "bin/llama-server",
+                "bin/cloudflared",
+                "config/model.json",
+                "config/cloudflare.json"
+              ]
+            }' > data/manifest.json
+
+      # ==========================================
+      # 14. VERIFY DATA
+      # ==========================================
+
+      - name: Verify complete data
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p logs
 
-          # Start the model server first.
-          nohup ./llama.cpp/build/bin/llama-server \
-            --model "$MODEL_PATH" \
-            --host 127.0.0.1 \
-            --port "$LLAMA_PORT" \
-            --ctx-size "$LLAMA_CTX_SIZE" \
-            --threads "$LLAMA_THREADS" \
-            --batch-size "$LLAMA_BATCH_SIZE" \
-            --parallel 1 \
-            --jinja \
-            --temp 0.6 \
-            --top-p 0.95 \
-            --top-k 40 \
-            --min-p 0.05 \
-            --repeat-penalty 1.1 \
-            > logs/llama-server.log 2>&1 &
+          test -s "$MODEL_PATH"
+          test -x "$LLAMA_SERVER"
+          test -x "$DATA_DIR/bin/cloudflared"
 
-          MODEL_PID=$!
-          echo "$MODEL_PID" > logs/llama-server.pid
+          [[ "$(head -c 4 "$MODEL_PATH")" == "GGUF" ]]
 
-          echo "Waiting for GPT-oss health check..."
+          jq empty data/manifest.json
+          jq empty data/config/model.json
+          jq empty data/config/cloudflare.json
 
-          for attempt in $(seq 1 180); do
-            if curl --silent --fail \
-              "http://127.0.0.1:${LLAMA_PORT}/health" >/dev/null; then
-              echo "GPT-oss is healthy."
-              break
-            fi
+          echo "All GPT-oss data verified."
 
-            if ! kill -0 "$MODEL_PID" 2>/dev/null; then
-              echo "::error::llama-server exited before becoming healthy."
-              tail -n 150 logs/llama-server.log || true
-              exit 1
-            fi
+          du -sh data
+          df -h /
 
-            if [[ "$attempt" -eq 180 ]]; then
-              echo "::error::Model did not become healthy within 15 minutes."
-              tail -n 150 logs/llama-server.log || true
-              exit 1
-            fi
+      # ==========================================
+      # 15. SAVE CACHE
+      # ==========================================
 
-            sleep 5
-          done
+      - name: Save data cache
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: gpt-oss-20b-${{ env.CACHE_VERSION }}-${{ inputs.quantization }}-ubuntu
 
-          # Start free Cloudflare Quick Tunnel.
-          cloudflared tunnel --no-autoupdate \
-            --url "http://127.0.0.1:${LLAMA_PORT}" \
-            > logs/cloudflared.log 2>&1 &
+      # ==========================================
+      # 16. START GPT-OSS AND QUICK TUNNEL
+      # ==========================================
 
-          TUNNEL_PID=$!
-          echo "$TUNNEL_PID" > logs/cloudflared.pid
+      - name: Start GPT-oss 20B and Public Tunnel
+        shell: bash
+        run: |
+          chmod +x scripts/start.sh
+          scripts/start.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          DATA_DIR: ${{ env.DATA_DIR }}
+          MODEL_PATH: ${{ env.MODEL_PATH }}
+          LLAMA_SERVER: ${{ env.LLAMA_SERVER }}
+          LLAMA_PORT: ${{ env.LLAMA_PORT }}
+          LLAMA_CTX_SIZE: ${{ inputs.context_size }}
+          LLAMA_THREADS: ${{ env.LLAMA_THREADS }}
+          LLAMA_BATCH_SIZE: ${{ env.LLAMA_BATCH_SIZE }}
 
-          echo "Waiting for public URL..."
+      # ==========================================
+      # 17. UPLOAD LOGS
+      # ==========================================
 
-          PUBLIC_URL=""
-
-          for attempt in $(seq 1 60); do
-            PUBLIC_URL="$(grep -Eo \
-              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
-              logs/cloudflared.log | head -n 1 || true)"
-
-            if [[ -n "$PUBLIC_URL" ]]; then
-              break
-            fi
-
-            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-              echo "::error::Cloudflare Quick Tunnel exited."
-              cat logs/cloudflared.log || true
-              exit 1
-            fi
-
-            sleep 2
-          done
-
-          if [[ -z "$PUBLIC_URL" ]]; then
-            echo "::error::Could not obtain the Quick Tunnel URL."
-            cat logs/cloudflared.log || true
-            exit 1
-          fi
-
-          {
-            echo "## GPT-oss 20B is ready"
-            echo
-            echo "**Public chat URL:** $PUBLIC_URL"
-            echo
-            echo "Temporary URL works while this GitHub Actions job is running."
-            echo "Protect this URL; anyone who obtains it may access the model."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "::notice title=GPT-oss 20B public URL::$PUBLIC_URL"
-          echo "GPT-oss is running. Keeping the workflow alive..."
-
-          wait "$TUNNEL_PID"
-
-      - name: Upload service logs if the job fails
+      - name: Upload service logs if failed
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: gpt-oss-20b-server-logs
-          path: logs/
+          path: data/logs/
           if-no-files-found: ignore
           retention-days: 3
