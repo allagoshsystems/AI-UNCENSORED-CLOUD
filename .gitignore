@@ -1,29 +1,110 @@
 
-# Large model files
-/data/models/*
+# ============================================================
+# UNIVERSAL AI MODEL DEPLOYMENT - GITIGNORE
+# ============================================================
 
-# Compiled executables
-/data/bin/*
+# Model files
+data/models/*
+!data/models/.gitkeep
+
+*.gguf
+*.ggml
+*.safetensors
+*.sft
+*.bin
+*.pt
+*.pth
+*.onnx
+*.model
+*.ckpt
+*.index
+
+# Downloaded executables and binaries
+data/bin/*
+!data/bin/.gitkeep
+
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.a
 
 # llama.cpp source and build
-/data/llama.cpp/
+data/llama.cpp/
+llama.cpp/
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
 
-# Runtime logs
-/data/logs/*
+# Downloaded AI resources
+data/cache/
+data/downloads/
+data/huggingface/
+data/tokenizers/
 
-# Private conversation exports
-/data/conversations/*
+# Logs
+data/logs/*
+!data/logs/.gitkeep
 
-# Secrets
-.env
-.env.*
-*.token
-secrets.json
+*.log
+logs/
 
-# Python
-__pycache__/
-*.pyc
+# Conversations and generated content
+data/conversations/*
+!data/conversations/.gitkeep
+
+data/outputs/
+data/generated/
+outputs/
+generated/
 
 # Temporary files
 *.tmp
+*.temp
 *.part
+*.lock
+*.pid
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Credentials and secrets
+.env
+.env.*
+!.env.example
+
+*.pem
+*.key
+*.crt
+secrets.json
+credentials.json
+token.txt
+hf_token.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+.pnpm-store/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Desktop.ini
+.DS_Store
+
+# GitHub temporary files
+.github/temp/
